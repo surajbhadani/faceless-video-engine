@@ -1,0 +1,17 @@
+.env
+token.json
+client_secret.json
+__pycache__/
+output/
+work/
+logs/
+assets/broll/
+assets/music/
+remotion/node_modules/
+remotion/public/
+
+# Channel identity: every deployment supplies its own
+config.json
+data/*.json
+assets/brand/
+branding/

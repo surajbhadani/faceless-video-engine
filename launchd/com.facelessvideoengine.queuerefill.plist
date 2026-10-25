@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.facelessvideoengine.queuerefill</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/sbhadani/Documents/Founder/faceless-video-engine/venv/bin/python</string>
+        <string>/Users/sbhadani/Documents/Founder/faceless-video-engine/run_daily.py</string>
+        <string>--build-queue</string>
+        <string>1</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/sbhadani/Documents/Founder/faceless-video-engine</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>14</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/sbhadani/Documents/Founder/faceless-video-engine/logs/launchd_queuerefill.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sbhadani/Documents/Founder/faceless-video-engine/logs/launchd_queuerefill.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

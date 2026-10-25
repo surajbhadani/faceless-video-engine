@@ -1,0 +1,375 @@
+"""Daily YouTube Shorts automation — orchestrator.
+
+Usage:
+  python run_daily.py                 # full run: generate + build + upload
+  python run_daily.py --no-upload     # build the video but don't upload
+  python run_daily.py --topic "..."   # force a specific topic
+  python run_daily.py --plan-file p.json  # skip AI, use a prepared plan (testing)
+  python run_daily.py --recover-only  # only upload videos stranded by a crashed run
+  python run_daily.py --build-queue N # pre-render N videos into queue/ without uploading
+  python run_daily.py --queue-status  # print how many videos are buffered in queue/
+
+A normal run first tries to post the oldest video already sitting in queue/
+(instant, needs the network only for the upload itself) and only falls back to
+generating one from scratch when the queue is empty.
+"""
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+
+from src import assemble, captions, script_gen, tts, visuals  # noqa: E402
+
+LOG_DIR = ROOT / "logs"
+OUT_DIR = ROOT / "output"
+BROLL_DIR = ROOT / "assets" / "broll"
+QUEUE_DIR = ROOT / "queue"
+
+
+def _pending_upload(video: Path) -> bool:
+    """True if this video is still waiting to reach YouTube (recovery will send it)."""
+    stamp = video.stem.split("_", 1)[-1]
+    return (ROOT / "work" / stamp / "plan.json").exists()
+
+
+def cleanup(current_workdir: Path, out_file: Path, uploaded: bool, config: dict) -> None:
+    """Delete everything the pipeline created that is no longer needed.
+
+    Policy: nothing is kept locally. Finished videos live on YouTube, stock clips
+    live on Pexels. The ONLY thing spared is a video that hasn't reached YouTube
+    yet (crash recovery uploads it on the next run, then deletes it).
+    """
+    # temp working files (clips, audio, subtitles) — always
+    shutil.rmtree(current_workdir, ignore_errors=True)
+    # the local copy of an uploaded video — it lives on YouTube now
+    if uploaded and out_file.exists():
+        out_file.unlink()
+    # local builds: delete everything except videos still pending upload
+    keep = int(config.get("cleanup", {}).get("keep_local_videos", 0))
+    videos = sorted(OUT_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in videos[keep:]:
+        if old == out_file and not uploaded:
+            continue  # a --no-upload build survives its own run; the next run sweeps it
+        if not _pending_upload(old):
+            old.unlink(missing_ok=True)
+    # leftover work dirs from crashed runs — spare only those backing a pending video
+    work_root = ROOT / "work"
+    if work_root.exists():
+        for leftover in work_root.iterdir():
+            if leftover == current_workdir:
+                continue
+            stamp = leftover.name
+            # a work dir touched within the last few hours may belong to a run
+            # that is still rendering (daily + weekly catch-up can start together
+            # after a boot); a genuinely crashed dir is swept by a later run
+            try:
+                if time.time() - leftover.stat().st_mtime < 6 * 3600:
+                    continue
+            except OSError:
+                pass
+            pending = any((OUT_DIR / f"{p}_{stamp}.mp4").exists() for p in ("short", "long"))
+            if not pending:
+                shutil.rmtree(leftover, ignore_errors=True)
+        for husk in work_root.iterdir():  # OneDrive can leave locked empty shells
+            try:
+                husk.rmdir()
+            except OSError:
+                pass
+    # cap the b-roll fallback cache (newest clips kept; only exists so a Pexels
+    # outage never produces a blank-screen video)
+    cap_mb = int(config.get("cleanup", {}).get("broll_cache_mb", 150))
+    total = 0
+    if BROLL_DIR.exists():
+        for clip in sorted(BROLL_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+            total += clip.stat().st_size
+            if total > cap_mb * 1024 * 1024:
+                clip.unlink(missing_ok=True)
+
+
+def log(msg: str) -> None:
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    print(line)
+    LOG_DIR.mkdir(exist_ok=True)
+    with open(LOG_DIR / f"{datetime.now():%Y-%m}.log", "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def _video_ok(path: Path) -> bool:
+    """ffprobe sanity check so a half-written file is never uploaded."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60)
+        return r.returncode == 0 and float(r.stdout.strip()) >= 10
+    except Exception:
+        return False
+
+
+def engage(url: str, plan: dict) -> None:
+    """Post the engagement comment and sort into a themed playlist.
+    Both are best-effort growth boosters — a failure never touches the run."""
+    from src import upload
+    try:
+        if plan.get("comment") and upload.post_comment(url, plan["comment"]):
+            log(f"    comment posted: {plan['comment'][:60]}")
+    except Exception as e:
+        log(f"    comment failed (non-fatal): {e}")
+    try:
+        if plan.get("playlist") and upload.add_to_playlist(url, plan["playlist"]):
+            log(f"    added to playlist: {plan['playlist']}")
+    except Exception as e:
+        log(f"    playlist failed (non-fatal): {e}")
+
+
+def recover_orphans(config: dict) -> None:
+    """Finish the job for any earlier run that died between render and upload.
+
+    A crashed run leaves two things behind: the finished mp4 in output/ and its
+    work/<stamp>/plan.json (cleanup only runs after a successful upload). That
+    pair is the signature of an orphan; test builds get their work dir cleaned,
+    so they are never picked up here.
+    """
+    if not config.get("upload", {}).get("enabled", True):
+        return
+    for video in sorted(list(OUT_DIR.glob("short_*.mp4")) + list(OUT_DIR.glob("long_*.mp4"))):
+        is_short = video.name.startswith("short_")
+        stamp = video.stem.split("_", 1)[1]
+        plan_path = ROOT / "work" / stamp / "plan.json"
+        if not plan_path.exists():
+            continue
+        try:
+            if not _video_ok(video):
+                log(f"Recovery: {video.name} is incomplete, deleting it.")
+                video.unlink(missing_ok=True)
+                shutil.rmtree(plan_path.parent, ignore_errors=True)
+                continue
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            label = plan.get("topic") or plan.get("theme")
+            log(f"Recovery: uploading stranded video {video.name} ({label})...")
+            from src import upload
+            url = upload.upload_video(video, plan, config, is_short=is_short)
+            log(f"    LIVE: {url}")
+            engage(url, plan)
+            thumb = plan_path.parent / "thumb.jpg"
+            if not is_short and thumb.exists():
+                try:
+                    upload.set_thumbnail(url, thumb)
+                except Exception as e:
+                    log(f"    thumbnail skipped: {e}")
+            entry = {
+                "date": f"{datetime.now():%Y-%m-%d}",
+                "title": plan["title"],
+                "file": video.name,
+                "url": url,
+            }
+            if is_short:
+                script_gen.save_history_entry({**entry, "topic": plan["topic"]})
+            else:
+                from src import longform_gen
+                longform_gen.save_history_entry({**entry, "theme": plan["theme"]})
+            video.unlink(missing_ok=True)
+            shutil.rmtree(plan_path.parent, ignore_errors=True)
+        except Exception:
+            log("Recovery failed for " + video.name + ":\n" + traceback.format_exc())
+
+
+def _build_video(config: dict, workdir: Path, stamp: str,
+                  forced_topic: str | None = None, plan_file: str | None = None) -> tuple:
+    """Steps 1-5: topic/script -> voiceover -> captions -> visuals -> render.
+    Returns (plan, out_file). Never uploads — callers decide what happens next."""
+    log("1/6 Generating topic + script...")
+    if plan_file:
+        plan = json.loads(Path(plan_file).read_text(encoding="utf-8"))
+    else:
+        plan = script_gen.generate_video_plan(config, forced_topic=forced_topic)
+    log(f"    topic: {plan['topic']}")
+    log(f"    title: {plan['title']}")
+    (workdir / "plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+
+    log("2/6 Creating voiceover (edge-tts)...")
+    voice_mp3 = workdir / "voice.mp3"
+    words = tts.make_voiceover(plan["script"], config, voice_mp3)
+    duration = words[-1]["end"]
+    log(f"    {len(words)} words, {duration:.1f}s")
+
+    log("3/6 Building captions...")
+    ass_file = workdir / "subs.ass"
+    # thumbnail-frame text: the hook, or the title when the hook runs long
+    hook = plan["script"].split(".")[0].split("?")[0].strip()
+    if len(hook.split()) > 12:
+        hook = plan["title"].replace("#Shorts", "").strip()
+    captions.build_ass(words, config, ass_file, hook=hook)
+
+    log("4/6 Fetching background clips...")
+    n_clips = config["video"].get("clips_count", 5)
+    td = float(config["video"].get("transition_seconds", 0.35))
+    terms = (plan["search_terms"] * n_clips)[:n_clips]
+    briefs = visuals.scene_prompt_list(plan["search_terms"], plan.get("scene_prompts"))
+    briefs = (briefs * n_clips)[:n_clips] if briefs else None
+    # clips overlap during crossfades, so each must be slightly longer (+ margin)
+    per_clip = (duration + 0.6 + (n_clips - 1) * td) / n_clips + 0.3
+    clips = visuals.fetch_clips(terms, per_clip, config, workdir, ai_prompts=briefs)
+
+    log("5/6 Assembling video (ffmpeg)...")
+    out_file = OUT_DIR / f"short_{stamp}.mp4"
+    assemble.build_video(clips, voice_mp3, ass_file, config, workdir, out_file,
+                         music_mood=plan.get("music_mood"), words=words, hook=hook)
+    log(f"    saved: {out_file}")
+    return plan, out_file
+
+
+def queue_depth() -> int:
+    if not QUEUE_DIR.exists():
+        return 0
+    return sum(1 for d in QUEUE_DIR.iterdir() if (d / "video.mp4").exists() and (d / "plan.json").exists())
+
+
+def build_queue(config: dict, count: int) -> None:
+    """Pre-render `count` videos (no upload) into queue/<stamp>/{video.mp4,plan.json}
+    so a day with API outages/rate limits can still post from the buffer."""
+    QUEUE_DIR.mkdir(exist_ok=True)
+    for i in range(count):
+        log(f"Queue build {i + 1}/{count} (buffer currently {queue_depth()})...")
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        workdir = ROOT / "work" / stamp
+        workdir.mkdir(parents=True, exist_ok=True)
+        try:
+            plan, out_file = _build_video(config, workdir, stamp)
+            qdir = QUEUE_DIR / stamp
+            qdir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(out_file), str(qdir / "video.mp4"))
+            shutil.move(str(workdir / "plan.json"), str(qdir / "plan.json"))
+            log(f"    queued as {stamp} (buffer now {queue_depth()})")
+        except Exception:
+            log("Queue build FAILED:\n" + traceback.format_exc())
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        if i < count - 1:
+            time.sleep(3)  # brief pause between renders, mainly for Pollinations cooldown
+
+
+def pop_queue() -> tuple:
+    """Return (stamp, video_path, plan) for the oldest queued video, or (None, None, None)."""
+    if not QUEUE_DIR.exists():
+        return None, None, None
+    candidates = sorted(
+        (d for d in QUEUE_DIR.iterdir() if (d / "video.mp4").exists() and (d / "plan.json").exists()),
+        key=lambda d: d.name,
+    )
+    if not candidates:
+        return None, None, None
+    qdir = candidates[0]
+    plan = json.loads((qdir / "plan.json").read_text(encoding="utf-8"))
+    return qdir.name, qdir / "video.mp4", plan
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-upload", action="store_true")
+    parser.add_argument("--topic", default=None)
+    parser.add_argument("--plan-file", default=None)
+    parser.add_argument("--recover-only", action="store_true")
+    parser.add_argument("--build-queue", type=int, default=None,
+                         help="pre-render N videos into queue/ without uploading")
+    parser.add_argument("--queue-status", action="store_true")
+    args = parser.parse_args()
+
+    config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+
+    if args.queue_status:
+        print(f"queue/: {queue_depth()} video(s) buffered")
+        return 0
+
+    if args.build_queue is not None:
+        build_queue(config, args.build_queue)
+        log(f"Queue build finished. Buffer now {queue_depth()} video(s).")
+        return 0
+
+    # pick up anything a crashed run left behind before (or instead of) a new run
+    if args.recover_only:
+        recover_orphans(config)
+        log("Recovery pass finished.")
+        return 0
+    if not args.no_upload and not args.plan_file:
+        recover_orphans(config)
+        # Grace-period retries fire this task repeatedly; once today's video is
+        # live (fresh upload or recovery), every later attempt is a no-op so the
+        # one-quality-video-per-day rule can never be broken.
+        today = f"{datetime.now():%Y-%m-%d}"
+        if not args.topic and any(
+            h.get("date") == today and h.get("url") for h in script_gen.load_history()
+        ):
+            log("Today's Short is already live — nothing to do.")
+            return 0
+
+        # Prefer posting from the pre-built buffer: instant, and keeps today's
+        # post alive even if script/image generation APIs are rate-limited or down.
+        if not args.topic:
+            qstamp, qvideo, qplan = pop_queue()
+            if qvideo is not None:
+                log(f"Posting from queue buffer ({qstamp})...")
+                try:
+                    from src import upload
+                    url = upload.upload_video(qvideo, qplan, config)
+                    log(f"    LIVE: {url}")
+                    engage(url, qplan)
+                    script_gen.save_history_entry({
+                        "date": today,
+                        "topic": qplan["topic"],
+                        "title": qplan["title"],
+                        "file": qvideo.name,
+                        "url": url,
+                    })
+                    shutil.rmtree(qvideo.parent, ignore_errors=True)
+                    log(f"Done. Buffer now {queue_depth()} video(s) remaining.")
+                    return 0
+                except Exception:
+                    log("Queue post FAILED, falling back to a fresh build:\n" + traceback.format_exc())
+
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    workdir = ROOT / "work" / stamp
+    workdir.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(exist_ok=True)
+
+    try:
+        plan, out_file = _build_video(config, workdir, stamp,
+                                       forced_topic=args.topic, plan_file=args.plan_file)
+
+        url = None
+        if args.no_upload or not config.get("upload", {}).get("enabled", True):
+            log("6/6 Upload skipped (--no-upload or disabled in config).")
+        else:
+            log("6/6 Uploading to YouTube...")
+            from src import upload
+            url = upload.upload_video(out_file, plan, config)
+            log(f"    LIVE: {url}")
+            engage(url, plan)
+
+        script_gen.save_history_entry({
+            "date": f"{datetime.now():%Y-%m-%d}",
+            "topic": plan["topic"],
+            "title": plan["title"],
+            "file": out_file.name,
+            "url": url,
+        })
+        cleanup(workdir, out_file, uploaded=url is not None, config=config)
+        log("Done (temp files cleaned).")
+        return 0
+    except Exception:
+        log("FAILED:\n" + traceback.format_exc())
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
